@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm> 
+#include <MurmurHash3.h>
+#include <limits>
 
 using namespace std;
 using Sparse_Vector = vector<pair<int, float>>;
@@ -111,56 +113,112 @@ float compute_mean_precision(vector<int> results, int k, vector<int> gtruth, int
     return mean_precision / numQueries; 
 }
 
+float *project(Dataset allData, size_t newDimension) {
+  float *newData = (float *)calloc(newDimension * allData.size(), sizeof(float));
+#pragma omp parallel for
+  for (size_t dataID = 0; dataID < allData.size(); dataID++) {
+    for (pair<int, float> sparse : allData[dataID]) {
+      for (size_t d = 0; d < newDimension; d++) {
+        int32_t result;
+        MurmurHash3_x86_32(&sparse.first, sizeof(int), d, &result);
+        float diff = (float)result * sparse.second / (float)INT32_MAX;
+        newData[newDimension * dataID + d] += diff;
+      }
+    }      
+  }
+
+  // Unitize vectors  
+  float *magnitudes = (float *)calloc(allData.size(), sizeof(float));
+#pragma omp parallel for
+  for (size_t dataID = 0; dataID < allData.size(); dataID++) {
+    for (size_t d = 0; d < newDimension; d++) {
+      magnitudes[dataID] += pow(newData[newDimension * dataID + d], 2);
+    }
+  }
+  for (size_t i = 0; i < allData.size(); i++) {
+    magnitudes[i] = pow(magnitudes[i], 0.5);
+  }
+#pragma omp parallel for
+  for (size_t dataID = 0; dataID < allData.size(); dataID++) {
+    for (size_t d = 0; d < newDimension; d++) {
+      newData[newDimension * dataID + d] /= magnitudes[dataID];
+    }
+  }
+  free(magnitudes);
+
+  // float total1 = 0;
+  // float total2 = 0;
+  // float total3 = 0;
+  // float total4 = 0;
+  // for (size_t dataID = 0; dataID < allData.size(); dataID++) {
+  //   total1 += newData[newDimension * dataID];
+  //   total2 += newData[newDimension * dataID + 1];
+  //   total3 += newData[newDimension * dataID + 2];
+  //   total4 += newData[newDimension * dataID + 3];
+  // }
+  // cout << total1 / allData.size() << " " << total2 / allData.size() << " " << total3 / allData.size() << " " << total4 / allData.size() << endl;
+  return newData;
+}
+
 pair<vector<int>, float> doQueries(size_t topK, Dataset allData, size_t numQueries, size_t groupsPerRep, size_t reps, size_t dataDim) {
   
   vector<int> results;
   size_t numData = allData.size() - numQueries;
+  size_t newDimension = 400;
 
+  // Group i will be all indices that equal i % totalGroups
   vector<int> groupIndices;
   for (size_t i = 0; i < numData; i++) {
-    groupIndices.push_back(i % groupsPerRep);
+    groupIndices.push_back(i);
   }
 
   // Groups numbered 0 ... totalGroups - 1
   size_t totalGroups = reps * groupsPerRep;
 
-
   // Entry i of memory vector for group j is i * totalGroups + j
-  float *groupVectors = (float *)calloc(totalGroups * dataDim, sizeof(float));
+  float *groupVectors = (float *)calloc(totalGroups * newDimension, sizeof(float));
   // The rep'th group of vector j is j * reps + rep
   int *dataToGroups = (int *)calloc(numData * reps, sizeof(int));
   // Vectors for group i are in groupsToData[i]
-  vector<vector<int>> groupsToData(totalGroups);
+  // vector<vector<int>> groupsToData(totalGroups);
+
+  // TODO: Back propogation
 
   cout << "Starting indexing " << endl;
 
   for (size_t rep = 0; rep < reps; rep++) {
-    
+
     // Get random group assignment
     random_shuffle(groupIndices.begin(), groupIndices.end());
-
-    for (size_t dataID = 0; dataID < numData; dataID++) {
-      size_t group = groupIndices[dataID] + rep * groupsPerRep;
-      dataToGroups[dataID * reps + rep] = group;
-      groupsToData[group].push_back(dataID); 
-
-      // Add vector to memory vectors
-      for (pair<int, float> sparse : allData[numQueries + dataID]) {
-        groupVectors[sparse.first * totalGroups + group] += sparse.second;
+#pragma omp parallel for
+    for (size_t groupInRep = 0; groupInRep < groupsPerRep; groupInRep++) {
+      size_t group = rep * groupsPerRep + groupInRep;
+      
+      for (size_t dataID = groupInRep; dataID < numData; dataID += groupsPerRep) {
+        dataToGroups[dataID * reps + rep] = group;
+        for (pair<int, float> sparse : allData[numQueries + dataID]) {
+          for (size_t d = 0; d < newDimension; d++) {
+            int32_t result;
+            MurmurHash3_x86_32(&sparse.first, sizeof(int), d, &result);
+            float diff = (float)result / (float)INT32_MAX;
+            groupVectors[d * totalGroups + group] += diff;
+          }
+        }      
       }
     }
   }
 
-  // Unitize memory vectors
+
+  // Unitize memory vectors  
   cout << "Unitizing" << endl;
   float *magnitudes = (float *)calloc(totalGroups, sizeof(float));
-  for (size_t i = 0; i < totalGroups * dataDim; i++) {
+  for (size_t i = 0; i < totalGroups * newDimension; i++) {
     magnitudes[i % totalGroups] += pow(groupVectors[i], 2);
   }
   for (size_t i = 0; i < totalGroups; i++) {
     magnitudes[i] = pow(magnitudes[i], 0.5);
   }
-  for (size_t i = 0; i < totalGroups * dataDim; i++) {
+  for (size_t i = 0; i < totalGroups * newDimension; i++) {
     groupVectors[i] /= magnitudes[i % totalGroups];
   }  
   free(magnitudes);
@@ -170,15 +228,35 @@ pair<vector<int>, float> doQueries(size_t topK, Dataset allData, size_t numQueri
   auto start = chrono::high_resolution_clock::now();
   for (size_t query = 0; query < numQueries; query++) {
 
-    float* dots = (float *)calloc(totalGroups, sizeof(float));
-
-    // Find the dot product of all memory vectors
+    // Find the new query vector 
+    float *projectedQuery = (float *)calloc(newDimension, sizeof(float));
     for (pair<int, float> sparse : allData[query]) {
-      for (size_t group = 0; group < totalGroups; group++) {
-        dots[group] += groupVectors[sparse.first * totalGroups + group] * sparse.second;
+      for (size_t d = 0; d < newDimension; d++) {
+        int32_t result;
+        MurmurHash3_x86_32(&sparse.first, sizeof(int), d, &result);
+        float diff = (float)result / (float)INT32_MAX;
+        projectedQuery[d] += diff;
       }
     }
 
+
+    // Find the dot product of all memory vectors
+    float* dots = (float *)calloc(totalGroups, sizeof(float));
+    for (size_t d = 0; d < newDimension; d++) {
+      for (size_t group = 0; group < totalGroups; group++) {
+        dots[group] += groupVectors[d * totalGroups + group] * projectedQuery[d];
+      }
+    }
+
+    // Print group info
+    // cout << query << endl;
+    // for (size_t group = 0; group < totalGroups; group++) {
+    //   cout << dots[group] << ": ";
+    //   for (int id : groupsToData[group]) {
+    //     cout << id << " ";
+    //   }
+    //   cout << endl;
+    // }
 
     vector<pair<double, int>> scores;
     for (size_t i = 0; i < numData; i++) {
@@ -194,7 +272,6 @@ pair<vector<int>, float> doQueries(size_t topK, Dataset allData, size_t numQueri
 
     for (size_t k = 0; k < topK; k++) {
       results.push_back(scores[k].second);
-      cout << scores[k].second << endl;
     }
   }
   auto stop = chrono::high_resolution_clock::now();
@@ -205,6 +282,28 @@ pair<vector<int>, float> doQueries(size_t topK, Dataset allData, size_t numQueri
   free(dataToGroups);
 
   return make_pair(results, mean_latency);
+}
+
+pair<vector<int>, float> bruteForce(float *data, size_t dimension, size_t numQueries, size_t numData, size_t k) {
+
+  vector<int> results(numQueries * k);
+#pragma omp parallel for
+  for (size_t q = 0; q < numQueries; q++) {
+    vector<pair<float, int>> dots;
+    for (size_t dataID = 0; dataID < numData; dataID++) {
+      float dot = 0;
+      for (size_t d = 0; d < dimension; d++) {
+        dot += data[q * dimension + d] * data[(numQueries + dataID) * dimension + d];
+      }
+      dots.emplace_back(-dot, dataID);
+    }
+    sort(dots.begin(), dots.end());
+    for (size_t n = 0; n < k; n++) {
+      results.at(q * k + n) = dots.at(n).second;
+    }
+  }
+
+  return make_pair(results, 0);
 }
 
 
@@ -222,15 +321,16 @@ int main(int argc, char **argv){
     size_t groupsPerRep = stoi(argv[6]);
     size_t groupReps = stoi(argv[7]);
     size_t dataDim = stoi(argv[8]);
+    size_t newDimension = 400;
 
     Dataset allData = readSparse(argv[1]);
     vector<int> gtruth = readGroundTruth(argv[3]);
 
-
-    cout << "Data read in " << allData.size() << endl;
+    float *denseData = project(allData, newDimension);
+    auto results = bruteForce(denseData, newDimension, numQueries, allData.size() - numQueries, k);
 
     // TODO: Change to loop over lots of numbers of groups
-    auto results = doQueries(k, allData, numQueries, groupsPerRep, groupReps, dataDim);
+    // auto results = doQueries(k, allData, numQueries, groupsPerRep, groupReps, dataDim);
 
     size_t numerators[]{1, 10, 100};
     for (size_t numerator : numerators) {
