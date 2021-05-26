@@ -1,13 +1,13 @@
 #!/bin/bash
 # Look, the chance that any of these finish at the same time is negligable, so
 # just write em all to the same file
-for groups in 20000 80000 320000
+for groups in 80000 320000
 do
   for reps in 2 4
   do 
     for batchsize in 10000 20000 80000
     do
-      for numbatches in 2 4 8
+      for numbatches in 1 2 4
       do
         for dimension in 200 400
         do
@@ -17,5 +17,6 @@ do
       done
     done
   done
-  wait
 done
+
+wait
